@@ -100,6 +100,7 @@ def main(args):
 
     resume_latest = args.resume == 'latest'
     log_base_path = os.path.join(args.logs, args.name)
+    #log_base_path = os.path.join('/data/cc/', args.name)
     args.log_path = None
     if is_master(args, local=args.log_local):
         os.makedirs(log_base_path, exist_ok=True)

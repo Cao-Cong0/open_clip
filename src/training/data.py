@@ -1,3 +1,5 @@
+from requests.exceptions import ConnectionError
+import time
 import ast
 import json
 import logging
@@ -8,6 +10,13 @@ import sys
 import braceexpand
 from dataclasses import dataclass
 from multiprocessing import Value
+import logging
+import pandas as pd
+import requests
+from PIL import Image
+from io import BytesIO
+from torchvision.transforms import ToTensor
+from torch.utils.data import Dataset
 
 import numpy as np
 import pandas as pd
@@ -25,27 +34,71 @@ try:
 except ImportError:
     hvd = None
 
+import PIL
 
 class CsvDataset(Dataset):
-    def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
+    def __init__(self, input_filename, transforms, img_key, caption_key, sep=",", tokenizer=None):
+    #def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
         logging.debug(f'Loading csv data from {input_filename}.')
-        df = pd.read_csv(input_filename, sep=sep)
-
-        self.images = df[img_key].tolist()
+        df = pd.read_csv(input_filename, sep=sep, header=0,engine='python')
+        #print(df)
+        print(df.columns)
+        df[['title', 'filepath']] = df['title,filepath'].str.split(',', expand=True)
         self.captions = df[caption_key].tolist()
+        self.image_urls = df[img_key].tolist()
         self.transforms = transforms
         logging.debug('Done loading data.')
-
         self.tokenize = tokenizer
 
     def __len__(self):
         return len(self.captions)
 
-    def __getitem__(self, idx):
-        images = self.transforms(Image.open(str(self.images[idx])))
-        texts = self.tokenize([str(self.captions[idx])])[0]
-        return images, texts
 
+    def __getitem__(self, idx):
+        image_url = self.image_urls[idx]
+        MAX_RETRIES = 5  # Maximum number of download attempts
+        DELAY_BETWEEN_RETRIES = 1  # Delay in seconds
+        TIMEOUT_VALUE = 30  # Timeout value in seconds
+
+        response = None  # Define response initially as None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.get(image_url, timeout=TIMEOUT_VALUE)
+                response.raise_for_status()  # Raises stored HTTPError, if one occurred.
+                if 'Content-Type' in response.headers and not response.headers['Content-Type'].startswith('image'):
+                    logging.warning(f"URL {image_url} does not point to an image. Content-Type: {response.headers['Content-Type']}")
+                    return self.default_image(), self.default_text()
+                break
+            except (requests.exceptions.RequestException, requests.exceptions.HTTPError) as e:
+                logging.warning(f"Exception occurred when trying to download image at {image_url}. This is attempt {attempt+1} of {MAX_RETRIES}.")
+                if attempt < MAX_RETRIES - 1:  # Don't sleep after the last attempt
+                    time.sleep(DELAY_BETWEEN_RETRIES)
+            except KeyError:
+                logging.warning(f"URL does not point to an image: {image_url}")
+                return self.default_image(), self.default_text()
+        else:  # This block will be executed if the for loop completes (i.e., no break encountered)
+            logging.warning(f"Failed to download image at {image_url} after {MAX_RETRIES} attempts.")
+            return self.default_image(), self.default_text()
+
+        try:
+            image = Image.open(BytesIO(response.content))
+            image = self.transforms(image)
+        except (IOError, SyntaxError) as e:
+            logging.warning(f"Cannot open or identify image at {image_url}.")
+            return self.default_image(), self.default_text()
+
+        texts = self.tokenize([str(self.captions[idx])])[0]
+        return image, texts
+
+    def default_image(self):
+        # Return a default image of your choice
+    #    Here's an example with a black image
+        return self.transforms(Image.new('RGB', (64, 64)))
+
+    def default_text(self):
+        # Return a default tensor for text
+        # Here's an example with an empty string
+        return self.tokenize([''])[0]
 
 class SharedEpoch:
     def __init__(self, epoch: int = 0):
@@ -441,18 +494,23 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
 
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
 
+def collate_fn(batch):
+    batch = [item for item in batch if item is not None]
+    return torch.utils.data.dataloader.default_collate(batch)
 
 def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data if is_train else args.val_data
     assert input_filename
     dataset = CsvDataset(
-        input_filename,
-        preprocess_fn,
-        img_key=args.csv_img_key,
-        caption_key=args.csv_caption_key,
-        sep=args.csv_separator,
-        tokenizer=tokenizer
+         input_filename,
+         preprocess_fn,
+         img_key=args.csv_img_key,
+         caption_key=args.csv_caption_key,
+         sep=args.csv_separator,
+         tokenizer=tokenizer
     )
+    #dataset = CsvDataset(input_filename, preprocess_fn, img_key='filepath', caption_key='title', sep=",", tokenizer=tokenizer)
+
     num_samples = len(dataset)
     sampler = DistributedSampler(dataset) if args.distributed and is_train else None
     shuffle = is_train and sampler is None
@@ -465,12 +523,12 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
         pin_memory=True,
         sampler=sampler,
         drop_last=is_train,
+        collate_fn=collate_fn
     )
     dataloader.num_samples = num_samples
     dataloader.num_batches = len(dataloader)
 
     return DataInfo(dataloader, sampler)
-
 
 class SyntheticDataset(Dataset):
 

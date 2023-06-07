@@ -82,6 +82,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     data_time_m = AverageMeter()
     end = time.time()
     for i, batch in enumerate(dataloader):
+        images, texts = batch
+        # Check if the image or texts are None (which would mean an error occurred in __getitem__)
+        if images is None or texts is None:
+            logging.warning("Skipping a batch due to failed image download.")
+            continue
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
 
